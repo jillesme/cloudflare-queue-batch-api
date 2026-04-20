@@ -27,7 +27,7 @@
 		{
 			"binding": "FEEDBACK_DB",
 			"database_name": "feedback-analysis-db",
-			"database_id": "01cca9e7-712b-4580-832b-342bd0abb899",
+			"database_id": "73d200aa-e226-4652-844e-2a8d2ee69b06",
 			"migrations_dir": "migrations"
 		}
 	]
