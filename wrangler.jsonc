@@ -1,0 +1,32 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "anthropic-feedback-batch-demo",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-04-20",
+	"triggers": {
+		"crons": ["* * * * *"]
+	},
+	"queues": {
+		"producers": [
+			{
+				"binding": "FEEDBACK_QUEUE",
+				"queue": "feedback-analysis-queue"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "feedback-analysis-queue",
+				"max_batch_size": 3,
+				"max_batch_timeout": 60
+			}
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "feedback_analysis_db",
+			"database_name": "feedback-analysis-db",
+			"database_id": "01cca9e7-712b-4580-832b-342bd0abb899",
+			"migrations_dir": "migrations"
+		}
+	]
+}
