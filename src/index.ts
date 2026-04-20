@@ -15,13 +15,7 @@ const FEEDBACK_SOURCES = [
 ] as const;
 const FEEDBACK_PRIORITIES = ["low", "medium", "high"] as const;
 const FEEDBACK_MODES = ["batch", "sync"] as const;
-const TERMINAL_STATUSES = [
-  "completed",
-  "failed",
-  "canceled",
-  "expired",
-  "enqueue_failed",
-] as const;
+const TERMINAL_STATUSES = ["completed", "failed", "enqueue_failed"] as const;
 
 type FeedbackCategory = (typeof FEEDBACK_CATEGORIES)[number];
 type FeedbackSource = (typeof FEEDBACK_SOURCES)[number];
@@ -94,41 +88,19 @@ interface AnthropicBatchRetrieveResponse {
   };
 }
 
-interface AnthropicSucceededResult {
-  type: "succeeded";
-  message: {
-    content: Array<{
-      type: string;
-      text?: string;
-    }>;
-  };
-}
-
-interface AnthropicErroredResult {
-  type: "errored";
-  error?: {
-    error?: {
-      type?: string;
-      message?: string;
-    };
-  };
-}
-
-interface AnthropicCanceledResult {
-  type: "canceled";
-}
-
-interface AnthropicExpiredResult {
-  type: "expired";
-}
-
+// Anthropic sends `type: "succeeded" | "errored" | "canceled" | "expired"`.
+// For a demo we only care about the happy path; anything else is a failure.
 interface AnthropicBatchResultLine {
   custom_id: string;
-  result:
-    | AnthropicSucceededResult
-    | AnthropicErroredResult
-    | AnthropicCanceledResult
-    | AnthropicExpiredResult;
+  result: {
+    type: "succeeded" | "errored" | "canceled" | "expired";
+    message?: {
+      content: Array<{ type: string; text?: string }>;
+    };
+    error?: {
+      error?: { message?: string };
+    };
+  };
 }
 
 interface FeedbackAnalysis {
@@ -199,25 +171,10 @@ export default {
       ids: batch.messages.map((message) => message.id),
     });
 
-    // Parse every message up front. If any single message is malformed, ack
-    // only that one and keep going with the rest of the batch.
-    const batchJobs: { message: Message<FeedbackJob>; job: FeedbackJob }[] = [];
-    for (const message of batch.messages) {
-      try {
-        batchJobs.push({ message, job: asFeedbackJob(message.body) });
-      } catch (error) {
-        console.error("Queue message is not a valid FeedbackJob, acking", {
-          messageId: message.id,
-          error: asErrorMessage(error),
-        });
-        message.ack();
-      }
-    }
-
     // Split by mode. Batch-mode jobs become one Anthropic Message Batch;
     // sync-mode jobs fan out to individual /v1/messages calls in parallel.
-    const batchModeJobs = batchJobs.filter(({ job }) => job.mode === "batch");
-    const syncModeJobs = batchJobs.filter(({ job }) => job.mode === "sync");
+    const batchModeJobs = batch.messages.filter((m) => m.body.mode === "batch");
+    const syncModeJobs = batch.messages.filter((m) => m.body.mode === "sync");
 
     await Promise.all([
       batchModeJobs.length > 0 ? processBatchMode(batchModeJobs, env) : Promise.resolve(),
@@ -258,11 +215,12 @@ async function handleFeedbackSubmission(
     return json({ ok: false, error: "Invalid JSON body" }, 400);
   }
 
-  const source = asFeedbackSource(body.source);
-  const text = asNonEmptyString(body.text);
-  const mode = asFeedbackMode(body.mode) ?? "batch";
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+  const source = body.source as FeedbackSource;
+  const mode: FeedbackMode =
+    body.mode === "sync" || body.mode === "batch" ? body.mode : "batch";
 
-  if (!source || !text) {
+  if (!text || !FEEDBACK_SOURCES.includes(source)) {
     return json(
       {
         ok: false,
@@ -314,12 +272,12 @@ async function handleFeedbackSubmission(
 }
 
 async function processBatchMode(
-  batchJobs: { message: Message<FeedbackJob>; job: FeedbackJob }[],
+  messages: Message<FeedbackJob>[],
   env: WorkerEnv,
 ): Promise<void> {
   // Turn the queue batch into one Anthropic Message Batch request.
   // Cheaper (50% discount) but asynchronous — the cron handler picks up results later.
-  const jobs = batchJobs.map(({ job }) => job);
+  const jobs = messages.map((m) => m.body);
   const requests = jobs.map(toAnthropicRequest);
 
   try {
@@ -335,7 +293,7 @@ async function processBatchMode(
         // Body may echo request fields; do NOT include request headers.
         body: await response.text(),
       });
-      for (const { message } of batchJobs) {
+      for (const message of messages) {
         message.retry({ delaySeconds: QUEUE_RETRY_DELAY_SECONDS });
       }
       return;
@@ -350,7 +308,7 @@ async function processBatchMode(
       createdBatch.processing_status,
     );
 
-    for (const { message } of batchJobs) message.ack();
+    for (const message of messages) message.ack();
 
     console.log("Created Anthropic message batch", {
       anthropicBatchId: createdBatch.id,
@@ -362,27 +320,27 @@ async function processBatchMode(
     console.error("Anthropic batch creation threw an error", {
       error: asErrorMessage(error),
     });
-    for (const { message } of batchJobs) {
+    for (const message of messages) {
       message.retry({ delaySeconds: QUEUE_RETRY_DELAY_SECONDS });
     }
   }
 }
 
 async function processSyncMode(
-  syncJobs: { message: Message<FeedbackJob>; job: FeedbackJob }[],
+  messages: Message<FeedbackJob>[],
   env: WorkerEnv,
 ): Promise<void> {
   // Call Anthropic's Messages API once per job, in parallel. Simpler and
   // fast enough for an interactive demo — no cron, results land in D1 in
   // seconds instead of minutes. Each job acks/retries independently.
-  await Promise.all(syncJobs.map(({ message, job }) => runSyncJob(env, message, job)));
+  await Promise.all(messages.map((message) => runSyncJob(env, message)));
 }
 
 async function runSyncJob(
   env: WorkerEnv,
   message: Message<FeedbackJob>,
-  job: FeedbackJob,
 ): Promise<void> {
+  const job = message.body;
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -669,14 +627,14 @@ async function storeBatchResults(
   // demo narration benefits from seeing each feedback mapped to its category.
   const outcomes: Array<{
     id: string;
-    status: "completed" | "failed" | "canceled" | "expired";
+    status: "completed" | "failed";
     category?: string;
     priority?: string;
     error?: string;
   }> = [];
 
-  // Prepare one UPDATE per result; flush them all in a single D1 transaction.
-  // Terminal rows also get `completed_at` stamped so the API can report elapsed time.
+  // Two prepared UPDATEs are enough: happy path writes the analysis fields;
+  // any non-succeeded result (errored/canceled/expired) is recorded as failed.
   const completedStmt = db.prepare(
     `UPDATE feedback_jobs
      SET status = 'completed',
@@ -699,77 +657,42 @@ async function storeBatchResults(
          completed_at = ?
      WHERE id = ?`,
   );
-  const canceledStmt = db.prepare(
-    `UPDATE feedback_jobs
-     SET status = 'canceled',
-         anthropic_processing_status = 'ended',
-         updated_at = ?,
-         completed_at = ?
-     WHERE id = ?`,
-  );
-  const expiredStmt = db.prepare(
-    `UPDATE feedback_jobs
-     SET status = 'expired',
-         anthropic_processing_status = 'ended',
-         updated_at = ?,
-         completed_at = ?
-     WHERE id = ?`,
-  );
 
   for (const line of resultLines) {
-    switch (line.result.type) {
-      case "succeeded": {
-        try {
-          const text = extractAssistantText(line.result.message.content);
-          const analysis = parseFeedbackAnalysis(text);
-          statements.push(
-            completedStmt.bind(
-              analysis.category,
-              analysis.priority,
-              analysis.summary,
-              JSON.stringify(analysis),
-              now,
-              now,
-              line.custom_id,
-            ),
-          );
-          outcomes.push({
-            id: line.custom_id,
-            status: "completed",
-            category: analysis.category,
-            priority: analysis.priority,
-          });
-        } catch (error) {
-          const errorMessage = asErrorMessage(error);
-          statements.push(
-            failedStmt.bind(errorMessage, now, now, line.custom_id),
-          );
-          outcomes.push({
-            id: line.custom_id,
-            status: "failed",
-            error: errorMessage,
-          });
-        }
-        break;
-      }
-      case "errored": {
-        const message =
-          line.result.error?.error?.message ?? "Anthropic batch item failed";
-        statements.push(failedStmt.bind(message, now, now, line.custom_id));
-        outcomes.push({ id: line.custom_id, status: "failed", error: message });
-        break;
-      }
-      case "canceled": {
-        statements.push(canceledStmt.bind(now, now, line.custom_id));
-        outcomes.push({ id: line.custom_id, status: "canceled" });
-        break;
-      }
-      case "expired": {
-        statements.push(expiredStmt.bind(now, now, line.custom_id));
-        outcomes.push({ id: line.custom_id, status: "expired" });
-        break;
+    if (line.result.type === "succeeded" && line.result.message) {
+      try {
+        const text = extractAssistantText(line.result.message.content);
+        const analysis = parseFeedbackAnalysis(text);
+        statements.push(
+          completedStmt.bind(
+            analysis.category,
+            analysis.priority,
+            analysis.summary,
+            JSON.stringify(analysis),
+            now,
+            now,
+            line.custom_id,
+          ),
+        );
+        outcomes.push({
+          id: line.custom_id,
+          status: "completed",
+          category: analysis.category,
+          priority: analysis.priority,
+        });
+        continue;
+      } catch (error) {
+        const errorMessage = asErrorMessage(error);
+        statements.push(failedStmt.bind(errorMessage, now, now, line.custom_id));
+        outcomes.push({ id: line.custom_id, status: "failed", error: errorMessage });
+        continue;
       }
     }
+
+    const errorMessage =
+      line.result.error?.error?.message ?? `Anthropic batch item ${line.result.type}`;
+    statements.push(failedStmt.bind(errorMessage, now, now, line.custom_id));
+    outcomes.push({ id: line.custom_id, status: "failed", error: errorMessage });
   }
 
   await db.batch(statements);
@@ -906,56 +829,6 @@ function anthropicHeaders(apiKey: string): HeadersInit {
     "x-api-key": apiKey,
     "anthropic-version": ANTHROPIC_API_VERSION,
   };
-}
-
-function asNonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function asFeedbackSource(value: unknown): FeedbackSource | null {
-  return typeof value === "string" &&
-    (FEEDBACK_SOURCES as readonly string[]).includes(value)
-    ? (value as FeedbackSource)
-    : null;
-}
-
-function asFeedbackMode(value: unknown): FeedbackMode | null {
-  return typeof value === "string" &&
-    (FEEDBACK_MODES as readonly string[]).includes(value)
-    ? (value as FeedbackMode)
-    : null;
-}
-
-function asFeedbackJob(value: unknown): FeedbackJob {
-  if (
-    value &&
-    typeof value === "object" &&
-    "id" in value &&
-    "source" in value &&
-    "text" in value &&
-    "submittedAt" in value
-  ) {
-    const candidate = value as Record<string, unknown>;
-    if (
-      typeof candidate.id === "string" &&
-      typeof candidate.source === "string" &&
-      typeof candidate.text === "string" &&
-      typeof candidate.submittedAt === "string" &&
-      (FEEDBACK_SOURCES as readonly string[]).includes(candidate.source)
-    ) {
-      return {
-        id: candidate.id,
-        source: candidate.source as FeedbackSource,
-        text: candidate.text,
-        submittedAt: candidate.submittedAt,
-        // Default to `batch` for backward compatibility with any in-flight
-        // messages enqueued before this field existed.
-        mode: asFeedbackMode(candidate.mode) ?? "batch",
-      };
-    }
-  }
-
-  throw new Error("Queue message body is not a valid FeedbackJob");
 }
 
 function asErrorMessage(error: unknown): string {
