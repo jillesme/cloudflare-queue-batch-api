@@ -287,7 +287,7 @@ async function handleFeedbackSubmission(
     id: job.id,
     source: job.source,
     mode: job.mode,
-    textLength: job.text.length,
+    text: previewText(job.text),
   });
 
   try {
@@ -411,6 +411,8 @@ async function runSyncJob(
 
     console.log("Sync feedback job completed", {
       id: job.id,
+      source: job.source,
+      text: previewText(job.text),
       category: analysis.category,
       priority: analysis.priority,
     });
@@ -663,6 +665,15 @@ async function storeBatchResults(
 
   const now = new Date().toISOString();
   const statements: D1PreparedStatement[] = [];
+  // Track per-item outcomes so we can log them after the batch commits. The
+  // demo narration benefits from seeing each feedback mapped to its category.
+  const outcomes: Array<{
+    id: string;
+    status: "completed" | "failed" | "canceled" | "expired";
+    category?: string;
+    priority?: string;
+    error?: string;
+  }> = [];
 
   // Prepare one UPDATE per result; flush them all in a single D1 transaction.
   // Terminal rows also get `completed_at` stamped so the API can report elapsed time.
@@ -722,10 +733,22 @@ async function storeBatchResults(
               line.custom_id,
             ),
           );
+          outcomes.push({
+            id: line.custom_id,
+            status: "completed",
+            category: analysis.category,
+            priority: analysis.priority,
+          });
         } catch (error) {
+          const errorMessage = asErrorMessage(error);
           statements.push(
-            failedStmt.bind(asErrorMessage(error), now, now, line.custom_id),
+            failedStmt.bind(errorMessage, now, now, line.custom_id),
           );
+          outcomes.push({
+            id: line.custom_id,
+            status: "failed",
+            error: errorMessage,
+          });
         }
         break;
       }
@@ -733,20 +756,48 @@ async function storeBatchResults(
         const message =
           line.result.error?.error?.message ?? "Anthropic batch item failed";
         statements.push(failedStmt.bind(message, now, now, line.custom_id));
+        outcomes.push({ id: line.custom_id, status: "failed", error: message });
         break;
       }
       case "canceled": {
         statements.push(canceledStmt.bind(now, now, line.custom_id));
+        outcomes.push({ id: line.custom_id, status: "canceled" });
         break;
       }
       case "expired": {
         statements.push(expiredStmt.bind(now, now, line.custom_id));
+        outcomes.push({ id: line.custom_id, status: "expired" });
         break;
       }
     }
   }
 
   await db.batch(statements);
+
+  if (outcomes.length === 0) return;
+
+  // Pull back source/text so the demo log shows which feedback became which
+  // classification. Using an IN() list keeps this to a single D1 read.
+  const placeholders = outcomes.map(() => "?").join(", ");
+  const rows = await db
+    .prepare(
+      `SELECT id, source, text FROM feedback_jobs WHERE id IN (${placeholders})`,
+    )
+    .bind(...outcomes.map((o) => o.id))
+    .all<{ id: string; source: string; text: string }>();
+
+  const byId = new Map(rows.results.map((row) => [row.id, row]));
+  for (const outcome of outcomes) {
+    const row = byId.get(outcome.id);
+    console.log("Batch feedback job " + outcome.status, {
+      id: outcome.id,
+      source: row?.source,
+      text: row ? previewText(row.text) : undefined,
+      category: outcome.category,
+      priority: outcome.priority,
+      error: outcome.error,
+    });
+  }
 }
 
 async function getFeedbackRow(db: D1Database, id: string): Promise<FeedbackRow | null> {
@@ -911,6 +962,13 @@ function asErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
 
+// Trim feedback text to a short single-line preview so console logs stay
+// readable while still showing what the model was actually classifying.
+function previewText(text: string, max = 60): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  return collapsed.length <= max ? collapsed : collapsed.slice(0, max - 1) + "…";
+}
+
 function safeJsonParse(value: string): unknown {
   try {
     return JSON.parse(value);
@@ -948,196 +1006,310 @@ function renderDemoPage(): string {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Feedback Demo</title>
+    <title>Feedback Classifier · Cloudflare Demo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
     <style>
       :root {
         color-scheme: light;
-        font-family: ui-sans-serif, system-ui, sans-serif;
-        --bg: #f6f4ef;
-        --panel: rgba(255, 255, 255, 0.86);
-        --panel-border: #d8d1c5;
-        --surface: #fffdf9;
-        --surface-muted: #f3eee6;
-        --text: #1f1d1a;
-        --text-muted: #5e584f;
-        --accent: #1f1d1a;
-        --accent-contrast: #f8f4ec;
-        --focus: #b9a88a;
-        --radius-lg: 18px;
-        --radius-md: 14px;
-        --radius-pill: 999px;
-        background: var(--bg);
-        color: var(--text);
+        --cream: #FFFCF6;
+        --coffee: #2C1A14;
+        --orange: #E85E2E;
+        --taupe: #DCCDBF;
+        --white: #FFFFFF;
+        --coffee-60: rgba(44, 26, 20, 0.6);
+        --coffee-40: rgba(44, 26, 20, 0.4);
       }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; }
       body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background:
-          radial-gradient(circle at top, rgba(186, 173, 146, 0.28), transparent 36%),
-          var(--bg);
+        background: var(--cream);
+        color: var(--coffee);
+        font-family: "Geist", ui-sans-serif, system-ui, sans-serif;
+        font-feature-settings: "ss01", "cv11";
+        -webkit-font-smoothing: antialiased;
       }
       main {
-        width: min(92vw, 460px);
+        width: 100%;
+        max-width: 520px;
+        margin: 0 auto;
         padding: 24px;
-        border: 1px solid var(--panel-border);
-        border-radius: var(--radius-lg);
-        background: var(--panel);
-        box-shadow: 0 18px 40px rgba(44, 38, 28, 0.08);
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
       }
       h1 {
-        margin: 0 0 8px;
-        font-size: 1.4rem;
+        margin: 0;
+        font-family: "Geist", sans-serif;
+        font-weight: 500;
+        font-size: 18px;
+        letter-spacing: -0.01em;
+        line-height: 1.2;
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
-      p {
-        margin: 0 0 18px;
-        color: var(--text-muted);
+      h1::before {
+        content: "";
+        width: 14px;
+        height: 2px;
+        background: var(--orange);
       }
-      form {
-        display: grid;
-        gap: 12px;
-      }
-      input, textarea, button {
-        font: inherit;
+      form { display: grid; gap: 14px; }
+      .field { display: grid; gap: 6px; }
+      label.field-label {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--coffee-60);
       }
       select, textarea {
+        font: inherit;
         width: 100%;
-        box-sizing: border-box;
-        border: 1px solid var(--panel-border);
-        border-radius: var(--radius-md);
-        padding: 12px 14px;
-        background: var(--surface);
-        color: var(--text);
-        transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+        border: 0;
+        border-bottom: 1px solid var(--taupe);
+        background: transparent;
+        color: var(--coffee);
+        padding: 10px 0;
+        border-radius: 0;
+        transition: border-color 140ms ease;
       }
       select {
         appearance: none;
-        background:
-          linear-gradient(45deg, transparent 50%, var(--text-muted) 50%) calc(100% - 22px) calc(50% - 2px) / 8px 8px no-repeat,
-          linear-gradient(135deg, var(--text-muted) 50%, transparent 50%) calc(100% - 16px) calc(50% - 2px) / 8px 8px no-repeat,
-          var(--surface);
-        padding-right: 38px;
+        background-image: linear-gradient(45deg, transparent 50%, var(--coffee) 50%),
+                          linear-gradient(135deg, var(--coffee) 50%, transparent 50%);
+        background-position: calc(100% - 14px) 18px, calc(100% - 8px) 18px;
+        background-size: 6px 6px, 6px 6px;
+        background-repeat: no-repeat;
+        padding-right: 28px;
+        cursor: pointer;
       }
       textarea {
-        min-height: 140px;
+        min-height: 56px;
         resize: vertical;
+        line-height: 1.5;
       }
-      select:focus, textarea:focus {
+      select:focus-visible, textarea:focus-visible {
         outline: none;
-        border-color: var(--focus);
-        box-shadow: 0 0 0 3px rgba(185, 168, 138, 0.18);
-        background: #fffefa;
+        border-bottom-color: var(--orange);
       }
-      button {
-        border: 0;
-        border-radius: var(--radius-pill);
-        padding: 12px 16px;
-        background: var(--accent);
-        color: var(--accent-contrast);
-        cursor: pointer;
-        transition: opacity 120ms ease, transform 120ms ease;
-      }
-      button:hover {
-        opacity: 0.96;
-      }
-      button:active {
-        transform: translateY(1px);
-      }
-      pre {
-        margin: 14px 0 0;
-        padding: 12px;
-        border-radius: var(--radius-md);
-        border: 1px solid rgba(31, 29, 26, 0.08);
-        background: var(--accent);
-        color: var(--accent-contrast);
-        overflow: auto;
-        white-space: pre-wrap;
-      }
-      .hint {
-        margin-top: 12px;
-        font-size: 0.92rem;
-        color: var(--text-muted);
-      }
+      ::placeholder { color: var(--coffee-40); }
+
       .mode {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 8px;
-        padding: 4px;
-        border: 1px solid var(--panel-border);
-        border-radius: var(--radius-pill);
-        background: var(--surface-muted);
+        border: 1px solid var(--taupe);
+        background: var(--white);
       }
       .mode label {
         position: relative;
         display: grid;
-        place-items: center;
-        padding: 10px 12px;
-        border-radius: var(--radius-pill);
-        font-size: 0.95rem;
-        color: var(--text-muted);
+        padding: 10px 14px;
+        gap: 2px;
         cursor: pointer;
         user-select: none;
-        transition: background 120ms ease, color 120ms ease;
+        transition: background 140ms ease, color 140ms ease;
       }
-      .mode label small {
-        display: block;
-        font-size: 0.72rem;
-        opacity: 0.7;
-        margin-top: 2px;
-      }
+      .mode label + label { border-left: 1px solid var(--taupe); }
       .mode input {
         position: absolute;
         opacity: 0;
         pointer-events: none;
       }
-      .mode input:checked + span {
-        color: var(--accent-contrast);
+      .mode .title {
+        font-weight: 500;
+        font-size: 14px;
+        letter-spacing: -0.005em;
+      }
+      .mode .caption {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 11px;
+        color: var(--coffee-60);
+        letter-spacing: 0.02em;
       }
       .mode label:has(input:checked) {
-        background: var(--accent);
-        color: var(--accent-contrast);
+        background: var(--orange);
+        color: var(--white);
       }
+      .mode label:has(input:checked) .caption { color: rgba(255, 255, 255, 0.8); }
+
+      button[type="submit"] {
+        font: inherit;
+        font-weight: 500;
+        font-size: 14px;
+        letter-spacing: 0.02em;
+        padding: 10px 18px;
+        border: 0;
+        background: var(--orange);
+        color: var(--white);
+        cursor: pointer;
+        transition: background 140ms ease, transform 80ms ease;
+        justify-self: start;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+      }
+      button[type="submit"]::after {
+        content: "→";
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+      }
+      button[type="submit"]:hover { background: #D54F20; }
+      button[type="submit"]:active { transform: translateY(1px); }
+      button[type="submit"]:focus-visible {
+        outline: 2px solid var(--coffee);
+        outline-offset: 3px;
+      }
+
+      .divider {
+        height: 1px;
+        background: var(--taupe);
+        margin: 0;
+      }
+
+      .status {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 12px;
+        color: var(--coffee-60);
+        letter-spacing: 0.02em;
+        min-height: 18px;
+      }
+      .status .elapsed { font-variant-numeric: tabular-nums; color: var(--coffee); }
+      .status .dot {
+        width: 6px; height: 6px;
+        border-radius: 50%;
+        background: var(--coffee-40);
+        margin-right: 8px;
+        display: inline-block;
+        vertical-align: middle;
+      }
+      .status[data-state="active"] .dot { background: var(--orange); animation: pulse 1.2s ease-in-out infinite; }
+      .status[data-state="done"] .dot { background: #3FA66B; }
+      @keyframes pulse {
+        0%, 100% { opacity: 0.35; }
+        50% { opacity: 1; }
+      }
+
+      .output {
+        border: 1px solid var(--taupe);
+        background: var(--white);
+        padding: 12px 14px;
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 11.5px;
+        line-height: 1.5;
+        color: var(--coffee);
+        white-space: pre-wrap;
+        overflow-x: auto;
+        max-height: 160px;
+        overflow-y: auto;
+        margin: 0;
+      }
+      .output-label {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--coffee-60);
+        margin-bottom: 10px;
+      }
+
+      footer {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 11px;
+        color: var(--coffee-40);
+        letter-spacing: 0.04em;
+      }
+      footer a {
+        color: var(--orange);
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+      }
+      footer a:hover { border-bottom-color: var(--orange); }
     </style>
   </head>
   <body>
     <main>
-      <h1>Feedback Demo</h1>
-      <p>Submit feedback, persist it in D1, queue it, and let Anthropic classify it.</p>
+      <h1>Cloudflare Queues Demo</h1>
+
       <form id="feedback-form">
-        <select name="source" required>
-          ${sourceOptions}
-        </select>
-        <div class="mode" role="radiogroup" aria-label="Processing mode">
-          <label>
-            <input type="radio" name="mode" value="sync" checked />
-            <span>Sync<small>Messages API &middot; seconds</small></span>
-          </label>
-          <label>
-            <input type="radio" name="mode" value="batch" />
-            <span>Batch<small>50% cheaper &middot; minutes</small></span>
-          </label>
+        <div class="field">
+          <label class="field-label" for="source">Source</label>
+          <select id="source" name="source" required>
+            ${sourceOptions}
+          </select>
         </div>
-        <textarea name="text" placeholder="What did the user say?" required></textarea>
-        <button type="submit">Queue Feedback</button>
+
+        <div class="field">
+          <span class="field-label">Processing mode</span>
+          <div class="mode" role="radiogroup" aria-label="Processing mode">
+            <label>
+              <input type="radio" name="mode" value="sync" checked />
+              <span class="title">Sync</span>
+              <span class="caption">Messages API &middot; seconds</span>
+            </label>
+            <label>
+              <input type="radio" name="mode" value="batch" />
+              <span class="title">Batch</span>
+              <span class="caption">50% cheaper &middot; minutes</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="feedback-text">Feedback</label>
+          <textarea id="feedback-text" name="text" placeholder="What did the user say?" required></textarea>
+        </div>
+
+        <button type="submit">Classify feedback</button>
       </form>
-      <p class="hint">Sync calls Anthropic once per job. Batch waits for 3 messages (or 60s) and submits them together via the Message Batches API.</p>
-      <p id="status" class="hint"></p>
-      <pre id="output">Waiting for submission...</pre>
+
+      <section>
+        <div class="status" id="status" data-state="idle">
+          <span><span class="dot"></span><span id="status-text">Awaiting submission</span></span>
+          <span class="elapsed" id="status-elapsed"></span>
+        </div>
+        <pre class="output" id="output" style="margin-top: 8px;">{ "ready": true }</pre>
+      </section>
+
+      <footer>
+        queue &rarr; anthropic &rarr; d1 &nbsp;&middot;&nbsp;
+        <a href="https://developers.cloudflare.com/queues/" target="_blank" rel="noreferrer">docs</a>
+      </footer>
     </main>
     <script>
       const TERMINAL_STATUSES = ${terminalStatuses};
-      const POLL_INTERVAL_MS = 2000;
-      const POLL_TIMEOUT_MS = 10 * 60 * 1000; // Anthropic batches usually finish <10m.
+      // Demo polls a handful of times then stops — this is a demo, not a
+      // long-lived dashboard. Batch jobs can take minutes; the user can refresh
+      // the page or hit the API directly once the cron has caught up.
+      const POLL_SCHEDULE_MS = [1000, 1500, 2000, 3000, 5000, 8000, 13000];
 
       const form = document.getElementById("feedback-form");
       const output = document.getElementById("output");
-      const status = document.getElementById("status");
+      const statusRoot = document.getElementById("status");
+      const statusText = document.getElementById("status-text");
+      const statusElapsed = document.getElementById("status-elapsed");
       let pollTimer = null;
+      let pollToken = 0;
+
+      function setStatus(state, text, elapsed) {
+        statusRoot.dataset.state = state;
+        statusText.textContent = text;
+        statusElapsed.textContent = elapsed || "";
+      }
 
       function stopPolling() {
+        pollToken++;
         if (pollTimer) {
-          clearInterval(pollTimer);
+          clearTimeout(pollTimer);
           pollTimer = null;
         }
       }
@@ -1147,7 +1319,9 @@ function renderDemoPage(): string {
         const totalSeconds = Math.floor(ms / 1000);
         const m = Math.floor(totalSeconds / 60);
         const s = totalSeconds % 60;
-        return m > 0 ? m + "m " + s + "s" : s + "s";
+        const mm = String(m).padStart(2, "0");
+        const ss = String(s).padStart(2, "0");
+        return mm + ":" + ss;
       }
 
       async function pollFeedback(id) {
@@ -1157,8 +1331,11 @@ function renderDemoPage(): string {
         const feedback = body.feedback || {};
         const isTerminal = TERMINAL_STATUSES.includes(feedback.status);
         const elapsed = formatElapsed(feedback.elapsed_ms);
-        status.textContent =
-          (isTerminal ? "Done in " : "Elapsed: ") + elapsed + " \u2022 status: " + feedback.status;
+        setStatus(
+          isTerminal ? "done" : "active",
+          feedback.status || "queued",
+          elapsed,
+        );
         return isTerminal;
       }
 
@@ -1173,8 +1350,8 @@ function renderDemoPage(): string {
           mode: formData.get("mode"),
         };
 
-        output.textContent = "Submitting...";
-        status.textContent = "";
+        output.textContent = "// submitting…";
+        setStatus("active", "submitting", "");
 
         const response = await fetch("/feedback", {
           method: "POST",
@@ -1185,22 +1362,36 @@ function renderDemoPage(): string {
         const body = await response.json();
         output.textContent = JSON.stringify(body, null, 2);
 
-        if (!body.ok || !body.id) return;
+        if (!body.ok || !body.id) {
+          setStatus("idle", "error", "");
+          return;
+        }
 
-        const startedAt = Date.now();
-        pollTimer = setInterval(async () => {
-          const done = await pollFeedback(body.id);
-          if (done) {
-            stopPolling();
-            return;
-          }
-          if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
-            stopPolling();
-            status.textContent =
-              "Stopped polling after " + formatElapsed(POLL_TIMEOUT_MS) +
-              " \u2014 check Anthropic dashboard.";
-          }
-        }, POLL_INTERVAL_MS);
+        setStatus("active", body.status || "queued", "00:00");
+        const token = ++pollToken;
+        let attempt = 0;
+
+        const schedule = () => {
+          const delay =
+            POLL_SCHEDULE_MS[Math.min(attempt, POLL_SCHEDULE_MS.length - 1)];
+          pollTimer = setTimeout(async () => {
+            if (token !== pollToken) return;
+            const done = await pollFeedback(body.id);
+            if (token !== pollToken) return;
+            if (done) {
+              pollTimer = null;
+              return;
+            }
+            attempt++;
+            if (attempt >= POLL_SCHEDULE_MS.length) {
+              pollTimer = null;
+              setStatus("idle", "still working — refresh to check", "");
+              return;
+            }
+            schedule();
+          }, delay);
+        };
+        schedule();
       });
     </script>
   </body>
